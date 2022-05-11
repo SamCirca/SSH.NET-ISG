@@ -33,7 +33,7 @@ namespace Renci.SshNet.Security
         {
             get
             {
-                return new BigInteger[] { publicKey.ToBigInteger() };
+                return new BigInteger[] { publicKey.ToBigInteger2() };
             }
             set
             {
@@ -51,7 +51,7 @@ namespace Renci.SshNet.Security
         {
             get
             {
-                return PublicKey.Length;
+                return PublicKey.Length * 8;
             }
         }
 
@@ -97,6 +97,15 @@ namespace Renci.SshNet.Security
         /// </summary>
         public ED25519Key()
         {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ED25519Key"/> class.
+        /// </summary>
+        /// <param name="pk">pk data.</param>
+        public ED25519Key(byte[] pk)
+        {
+            publicKey = pk.TrimLeadingZeros().Pad(Ed25519.PublicKeySizeInBytes);
         }
 
         /// <summary>

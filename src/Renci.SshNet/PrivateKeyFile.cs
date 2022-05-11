@@ -26,13 +26,13 @@ namespace Renci.SshNet
     /// The following private keys are supported:
     /// <list type="bullet">
     ///     <item>
-    ///         <description>RSA in OpenSSL PEM and ssh.com format</description>
+    ///         <description>RSA in OpenSSL PEM, ssh.com and OpenSSH key format</description>
     ///     </item>
     ///     <item>
     ///         <description>DSA in OpenSSL PEM and ssh.com format</description>
     ///     </item>
     ///     <item>
-    ///         <description>ECDSA 256/384/521 in OpenSSL PEM format</description>
+    ///         <description>ECDSA 256/384/521 in OpenSSL PEM and OpenSSH key format</description>
     ///     </item>
     ///     <item>
     ///         <description>ED25519 in OpenSSH key format</description>
@@ -63,7 +63,7 @@ namespace Renci.SshNet
     /// </list>
     /// </para>
     /// </remarks>
-    public class PrivateKeyFile : IDisposable
+    public class PrivateKeyFile : IPrivateKeySource, IDisposable
     {
         private static readonly Regex PrivateKeyRegex = new Regex(@"^-+ *BEGIN (?<keyName>\w+( \w+)*) PRIVATE KEY *-+\r?\n((Proc-Type: 4,ENCRYPTED\r?\nDEK-Info: (?<cipherName>[A-Z0-9-]+),(?<salt>[A-F0-9]+)\r?\n\r?\n)|(Comment: ""?[^\r\n]*""?\r?\n))?(?<data>([a-zA-Z0-9/+=]{1,80}\r?\n)+)-+ *END \k<keyName> PRIVATE KEY *-+",
 #if FEATURE_REGEX_COMPILE
@@ -78,6 +78,15 @@ namespace Renci.SshNet
         /// Gets the host key.
         /// </summary>
         public HostAlgorithm HostKey { get; private set; }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="PrivateKeyFile"/> class.
+        /// </summary>
+        /// <param name="key">The key.</param>
+        public PrivateKeyFile(Key key)
+        {
+            HostKey = new KeyHostAlgorithm(key.ToString(), key);
+        }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="PrivateKeyFile"/> class.
@@ -262,7 +271,7 @@ namespace Renci.SshNet
 
                     if (decryptedLength > blobSize - 4)
                         throw new SshException("Invalid passphrase.");
-                    
+
                     if (keyType == "if-modn{sign{rsa-pkcs1-sha1},encrypt{rsa-pkcs1v2-oaep}}")
                     {
                         var exponent = reader.ReadBigIntWithBits();//e
@@ -373,7 +382,7 @@ namespace Renci.SshNet
         /// <param name="keyFileData">the key file data (i.e. base64 encoded data between the header/footer)</param>
         /// <param name="passPhrase">passphrase or null if there isn't one</param>
         /// <returns></returns>
-        private ED25519Key ParseOpenSshV1Key(byte [] keyFileData, string passPhrase)
+        private Key ParseOpenSshV1Key(byte[] keyFileData, string passPhrase)
         {
             var keyReader = new SshDataReader(keyFileData);
 
@@ -387,8 +396,10 @@ namespace Renci.SshNet
 
             //cipher will be "aes256-cbc" if using a passphrase, "none" otherwise
             var cipherName = keyReader.ReadString(Encoding.UTF8);
+
             //key derivation function (kdf): bcrypt or nothing
             var kdfName = keyReader.ReadString(Encoding.UTF8);
+
             //kdf options length: 24 if passphrase, 0 if no passphrase
             var kdfOptionsLen = (int)keyReader.ReadUInt32();
             byte[] salt = null;
@@ -407,29 +418,21 @@ namespace Renci.SshNet
                 throw new SshException("At this time only one public key in the openssh key is supported.");
             }
 
-            //length of first public key section
-            keyReader.ReadUInt32();
-            var keyType = keyReader.ReadString(Encoding.UTF8);
-            if(keyType != "ssh-ed25519")
-            {
-                throw new SshException("openssh key type: " + keyType + " is not supported");
-            }
-
-            //read public key
-            var publicKeyLength = (int)keyReader.ReadUInt32(); //32
-            var publicKey = keyReader.ReadBytes(publicKeyLength);
+            //read public key in ssh-format, but we dont need it
+            keyReader.ReadString(Encoding.UTF8);
 
             //possibly encrypted private key
             var privateKeyLength = (int)keyReader.ReadUInt32();
             var privateKeyBytes = keyReader.ReadBytes(privateKeyLength);
 
             //decrypt private key if necessary
-            if (cipherName == "aes256-cbc")
+            if (cipherName != "none")
             {
                 if (string.IsNullOrEmpty(passPhrase))
                 {
                     throw new SshPassPhraseNullOrEmptyException("Private key is encrypted but passphrase is empty.");
                 }
+
                 if (string.IsNullOrEmpty(kdfName) || kdfName != "bcrypt")
                 {
                     throw new SshException("kdf " + kdfName + " is not supported for openssh key file");
@@ -445,13 +448,20 @@ namespace Renci.SshNet
                 byte[] iv = new byte[16];
                 Array.Copy(keyiv, 32, iv, 0, 16);
 
-                //now that we have the key/iv, use a cipher to decrypt the bytes
-                var cipher = new AesCipher(key, new CbcCipherMode(iv), new PKCS7Padding());
+                AesCipher cipher;
+                switch (cipherName)
+                {
+                    case "aes256-cbc":
+                        cipher = new AesCipher(key, new CbcCipherMode(iv), new PKCS7Padding());
+                        break;
+                    case "aes256-ctr":
+                        cipher = new AesCipher(key, new CtrCipherMode(iv), new PKCS7Padding());
+                        break;
+                    default:
+                        throw new SshException("Cipher '" + cipherName + "' is not supported for an OpenSSH key.");
+                }
+
                 privateKeyBytes = cipher.Decrypt(privateKeyBytes);
-            }
-            else if (cipherName != "none")
-            {
-                throw new SshException("cipher name " + cipherName + " for openssh key file is not supported");
             }
 
             //validate private key length
@@ -470,25 +480,51 @@ namespace Renci.SshNet
             int checkInt1 = (int)privateKeyReader.ReadUInt32();
             int checkInt2 = (int)privateKeyReader.ReadUInt32();
             if (checkInt1 != checkInt2)
+                throw new SshException("The random check bytes of the OpenSSH key do not match (" + checkInt1 + " <->" + checkInt2 + ").");
+
+            //key type
+            var keyType = privateKeyReader.ReadString(Encoding.UTF8);
+
+            Key parsedKey;
+            byte[] publicKey;
+            byte[] unencryptedPrivateKey;
+            switch (keyType)
             {
-                throw new SshException("The checkints differed, the openssh key was not correctly decoded.");
+                case "ssh-ed25519":
+                    //public key
+                    publicKey = privateKeyReader.ReadBignum2();
+                    //private key
+                    unencryptedPrivateKey = privateKeyReader.ReadBignum2();
+                    parsedKey = new ED25519Key(publicKey.Reverse(), unencryptedPrivateKey);
+                    break;
+#if FEATURE_ECDSA
+                case "ecdsa-sha2-nistp256":
+                case "ecdsa-sha2-nistp384":
+                case "ecdsa-sha2-nistp521":
+                    // curve
+                    int len = (int)privateKeyReader.ReadUInt32();
+                    var curve = Encoding.ASCII.GetString(privateKeyReader.ReadBytes(len));
+                    //public key
+                    publicKey = privateKeyReader.ReadBignum2();
+                    //private key
+                    unencryptedPrivateKey = privateKeyReader.ReadBignum2();
+                    parsedKey = new EcdsaKey(curve, publicKey, unencryptedPrivateKey.TrimLeadingZeros());
+                    break;
+#endif
+                case "ssh-rsa":
+                    var modulus = privateKeyReader.ReadBignum(); //n
+                    var exponent = privateKeyReader.ReadBignum(); //e
+                    var d = privateKeyReader.ReadBignum(); //d
+                    var inverseQ = privateKeyReader.ReadBignum(); // iqmp
+                    var p = privateKeyReader.ReadBignum(); //p
+                    var q = privateKeyReader.ReadBignum(); //q
+                    parsedKey = new RsaKey(modulus, exponent, d, p, q, inverseQ);
+                    break;
+                default:
+                    throw new SshException("OpenSSH key type '" + keyType + "' is not supported.");
             }
 
-            //key type, we already know it is ssh-ed25519
-            privateKeyReader.ReadString(Encoding.UTF8);
-
-            //public key length/bytes (again)
-            var publicKeyLength2 = (int)privateKeyReader.ReadUInt32();
-            privateKeyReader.ReadBytes(publicKeyLength2);
-
-            //length of private and public key (64)
-            privateKeyReader.ReadUInt32();
-            var unencryptedPrivateKey = privateKeyReader.ReadBytes(32);
-            //public key (again)
-            privateKeyReader.ReadBytes(32);
-
-            //comment, we don't need this but we could log it, not sure if necessary
-            var comment = privateKeyReader.ReadString(Encoding.UTF8);
+            parsedKey.Comment = privateKeyReader.ReadString(Encoding.UTF8);
 
             //The list of privatekey/comment pairs is padded with the bytes 1, 2, 3, ...
             //until the total length is a multiple of the cipher block size.
@@ -501,7 +537,7 @@ namespace Renci.SshNet
                 }
             }
 
-            return new ED25519Key(publicKey.Reverse(), unencryptedPrivateKey);
+            return parsedKey;
         }
 
         #region IDisposable Members
@@ -592,6 +628,17 @@ namespace Renci.SshNet
                 Buffer.BlockCopy(data, 0, bytesArray, 1, data.Length);
 
                 return new BigInteger(bytesArray.Reverse());
+            }
+
+            public BigInteger ReadBignum()
+            {
+                return new BigInteger(ReadBignum2().Reverse());
+            }
+
+            public byte[] ReadBignum2()
+            {
+                var length = (int)base.ReadUInt32();
+                return base.ReadBytes(length);
             }
 
             protected override void LoadData()
